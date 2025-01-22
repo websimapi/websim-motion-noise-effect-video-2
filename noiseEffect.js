@@ -2,101 +2,133 @@ export class NoiseEffect {
   constructor(videoElement, canvasElement) {
     this.video = videoElement;
     this.canvas = canvasElement;
-    this.ctx = this.canvas.getContext('2d', { alpha: false });
+    this.ctx = this.canvas.getContext('2d', {
+      alpha: false,
+      desynchronized: true
+    });
     
-    // Performance optimizations
+    // Enable image smoothing for better performance
     this.ctx.imageSmoothingEnabled = false;
     
     this.mediaStream = null;
     this.previousFrame = null;
-    this.previousCtx = null;
     this.staticNoisePattern = null;
     this.isCapturing = false;
     this.animationFrameId = null;
     this.lastProcessedTime = 0;
-    this.processInterval = 1000 / 60; // Increase to 60 fps
+    this.processInterval = 1000 / 30; // 30 fps
     
-    // Pre-allocate buffers
-    this.tempCanvas = document.createElement('canvas');
-    this.tempCtx = this.tempCanvas.getContext('2d', { alpha: false });
-    this.tempCtx.imageSmoothingEnabled = false;
+    // Create offscreen canvases for double buffering
+    this.offscreenCanvas = document.createElement('canvas');
+    this.offscreenCtx = this.offscreenCanvas.getContext('2d', {
+      alpha: false,
+      desynchronized: true
+    });
     
-    this.noiseCanvas = document.createElement('canvas');
-    this.noiseCtx = this.noiseCanvas.getContext('2d', { alpha: false });
-    this.noiseCtx.imageSmoothingEnabled = false;
-    this.motionMask = null;
-    this.outputImageData = null;
+    // Pre-generate noise patterns
+    this.noisePatternCache = new Map();
+    
+    // Performance optimization flags
+    this.motionThreshold = 35;
+    this.skipPixels = 2; // Process every nth pixel
   }
 
   generateNoisePattern(width, height) {
-    const imageData = this.noiseCtx.createImageData(width, height);
+    const key = `${width}-${height}`;
+    if (this.noisePatternCache.has(key)) {
+      return this.noisePatternCache.get(key);
+    }
+
+    const noiseCanvas = document.createElement('canvas');
+    noiseCanvas.width = width;
+    noiseCanvas.height = height;
+    const noiseCtx = noiseCanvas.getContext('2d', {
+      alpha: false,
+      desynchronized: true
+    });
+    
+    const imageData = noiseCtx.createImageData(width, height);
     const data = imageData.data;
-    const length = data.length;
     
-    // Use Uint32Array for faster buffer manipulation
-    const buf = new Uint32Array(imageData.data.buffer);
-    
-    for (let i = 0; i < buf.length; i++) {
-      // Generate noise for 4 pixels at once
-      buf[i] = Math.random() > 0.5 ? 0xFFFFFFFF : 0xFF000000;
+    // Generate noise in a single pass
+    for (let i = 0; i < data.length; i += 4) {
+      const value = Math.random() > 0.5 ? 255 : 0;
+      data[i] = value;     // R
+      data[i + 1] = value; // G
+      data[i + 2] = value; // B
+      data[i + 3] = 255;   // A
     }
     
-    this.noiseCtx.putImageData(imageData, 0, 0);
-    return this.noiseCanvas;
+    noiseCtx.putImageData(imageData, 0, 0);
+    this.noisePatternCache.set(key, noiseCanvas);
+    return noiseCanvas;
   }
 
   detectMotion(currentFrame, previousFrame) {
     const width = currentFrame.width;
     const height = currentFrame.height;
-    const size = width * height;
     
-    // Reuse existing arrays
-    if (!this.motionMask || this.motionMask.length !== size) {
-      this.motionMask = new Uint8ClampedArray(size);
-    }
+    const current = this.offscreenCtx.getImageData(0, 0, width, height).data;
+    const previous = previousFrame.getContext('2d').getImageData(0, 0, width, height).data;
     
-    const currentData = this.tempCtx.getImageData(0, 0, width, height).data;
-    const prevData = this.previousCtx.getImageData(0, 0, width, height).data;
+    const motionMask = new Uint8ClampedArray(current.length / 4);
     
-    // Optimize motion detection loop
-    for (let i = 0, j = 0; i < currentData.length; i += 16, j += 4) {
-      const diff = Math.abs(currentData[i] - prevData[i]) +
-                   Math.abs(currentData[i + 1] - prevData[i + 1]) +
-                   Math.abs(currentData[i + 2] - prevData[i + 2]);
+    // Optimize motion detection by processing fewer pixels
+    for (let i = 0; i < current.length; i += 4 * this.skipPixels) {
+      const diff = Math.abs(current[i] - previous[i]) +
+                  Math.abs(current[i + 1] - previous[i + 1]) +
+                  Math.abs(current[i + 2] - previous[i + 2]);
       
-      // Process 4 pixels at once
-      const motion = diff > 90 ? 1 : 0;
-      this.motionMask[j] = motion;
-      this.motionMask[j + 1] = motion;
-      this.motionMask[j + 2] = motion;
-      this.motionMask[j + 3] = motion;
-    }
-    
-    return this.motionMask;
-  }
-
-  applyNoiseEffect(width, height, motionMask) {
-    if (!this.outputImageData || this.outputImageData.width !== width) {
-      this.outputImageData = this.ctx.createImageData(width, height);
-    }
-    
-    const data = this.outputImageData.data;
-    const newNoise = this.generateNoisePattern(width, height);
-    const noiseData = this.noiseCtx.getImageData(0, 0, width, height).data;
-    
-    // Use TypedArray for faster array operations
-    const uint32Data = new Uint32Array(data.buffer);
-    const uint32Noise = new Uint32Array(noiseData.buffer);
-    
-    for (let i = 0; i < uint32Data.length; i++) {
-      if (motionMask[i]) {
-        uint32Data[i] = uint32Noise[i];
-      } else if (!this.staticNoisePattern) {
-        uint32Data[i] = uint32Noise[i];
+      const idx = i / 4;
+      motionMask[idx] = diff > this.motionThreshold ? 1 : 0;
+      
+      // Copy the same motion value to skipped pixels
+      for (let j = 1; j < this.skipPixels && idx + j < motionMask.length; j++) {
+        motionMask[idx + j] = motionMask[idx];
       }
     }
     
-    this.ctx.putImageData(this.outputImageData, 0, 0);
+    return motionMask;
+  }
+
+  applyNoiseEffect(currentFrame, motionMask) {
+    const width = currentFrame.width;
+    const height = currentFrame.height;
+    
+    if (!this.staticNoisePattern || 
+        this.staticNoisePattern.width !== width || 
+        this.staticNoisePattern.height !== height) {
+      this.staticNoisePattern = this.generateNoisePattern(width, height);
+    }
+    
+    // Use the offscreen canvas for compositing
+    this.offscreenCanvas.width = width;
+    this.offscreenCanvas.height = height;
+    
+    // Draw static noise background
+    this.offscreenCtx.drawImage(this.staticNoisePattern, 0, 0);
+    
+    // Apply motion-based noise only to moving regions
+    const frameData = this.offscreenCtx.getImageData(0, 0, width, height);
+    const newNoise = this.generateNoisePattern(width, height);
+    const noiseData = newNoise.getContext('2d').getImageData(0, 0, width, height).data;
+    
+    // Optimize pixel processing
+    for (let i = 0; i < frameData.data.length; i += 4 * this.skipPixels) {
+      const pixelIndex = i / 4;
+      if (motionMask[pixelIndex]) {
+        const noiseValue = noiseData[i];
+        for (let j = 0; j < 4 * this.skipPixels && i + j < frameData.data.length; j += 4) {
+          frameData.data[i + j] = noiseValue;     // R
+          frameData.data[i + j + 1] = noiseValue; // G
+          frameData.data[i + j + 2] = noiseValue; // B
+          frameData.data[i + j + 3] = 255;        // A
+        }
+      }
+    }
+    
+    this.offscreenCtx.putImageData(frameData, 0, 0);
+    return this.offscreenCanvas;
   }
 
   processFrame() {
@@ -106,39 +138,42 @@ export class NoiseEffect {
     const deltaTime = currentTime - this.lastProcessedTime;
     
     if (deltaTime >= this.processInterval) {
-      const width = this.video.videoWidth;
-      const height = this.video.videoHeight;
-      
-      // Setup canvases if needed
-      if (this.tempCanvas.width !== width) {
-        this.tempCanvas.width = width;
-        this.tempCanvas.height = height;
-        this.noiseCanvas.width = width;
-        this.noiseCanvas.height = height;
-        
-        if (!this.previousCtx) {
-          const prevCanvas = document.createElement('canvas');
-          prevCanvas.width = width;
-          prevCanvas.height = height;
-          this.previousCtx = prevCanvas.getContext('2d', { alpha: false });
-          this.previousCtx.imageSmoothingEnabled = false;
-        }
+      // Create temporary canvas with video dimensions
+      if (!this.tempCanvas) {
+        this.tempCanvas = document.createElement('canvas');
       }
-      
-      // Draw current frame
-      this.tempCtx.drawImage(this.video, 0, 0);
+      this.tempCanvas.width = this.video.videoWidth;
+      this.tempCanvas.height = this.video.videoHeight;
+      const tempCtx = this.tempCanvas.getContext('2d', {
+        alpha: false,
+        desynchronized: true
+      });
+      tempCtx.drawImage(this.video, 0, 0);
       
       if (this.previousFrame) {
         const motionMask = this.detectMotion(this.tempCanvas, this.previousFrame);
-        this.applyNoiseEffect(width, height, motionMask);
+        const processedFrame = this.applyNoiseEffect(this.tempCanvas, motionMask);
+        this.ctx.drawImage(processedFrame, 0, 0, this.canvas.width, this.canvas.height);
       } else {
-        this.staticNoisePattern = this.generateNoisePattern(width, height);
-        this.ctx.drawImage(this.staticNoisePattern, 0, 0);
+        this.staticNoisePattern = this.generateNoisePattern(
+          this.video.videoWidth,
+          this.video.videoHeight
+        );
+        this.ctx.drawImage(
+          this.staticNoisePattern,
+          0, 0,
+          this.canvas.width,
+          this.canvas.height
+        );
       }
       
-      // Store current frame
-      this.previousCtx.drawImage(this.tempCanvas, 0, 0);
-      this.previousFrame = this.tempCanvas;
+      // Swap frames
+      this.previousFrame = this.tempCanvas.cloneNode(true);
+      this.previousFrame.getContext('2d', {
+        alpha: false,
+        desynchronized: true
+      }).drawImage(this.tempCanvas, 0, 0);
+      
       this.lastProcessedTime = currentTime;
     }
     
@@ -169,7 +204,6 @@ export class NoiseEffect {
     
     this.isCapturing = false;
     this.previousFrame = null;
-    this.previousCtx = null;
     this.staticNoisePattern = null;
     this.video.srcObject = null;
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
