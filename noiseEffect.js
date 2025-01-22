@@ -2,96 +2,101 @@ export class NoiseEffect {
   constructor(videoElement, canvasElement) {
     this.video = videoElement;
     this.canvas = canvasElement;
-    this.ctx = this.canvas.getContext('2d');
+    this.ctx = this.canvas.getContext('2d', { alpha: false });
+    
+    // Performance optimizations
+    this.ctx.imageSmoothingEnabled = false;
     
     this.mediaStream = null;
     this.previousFrame = null;
+    this.previousCtx = null;
     this.staticNoisePattern = null;
     this.isCapturing = false;
     this.animationFrameId = null;
     this.lastProcessedTime = 0;
-    this.processInterval = 1000 / 30; // 30 fps
+    this.processInterval = 1000 / 60; // Increase to 60 fps
+    
+    // Pre-allocate buffers
+    this.tempCanvas = document.createElement('canvas');
+    this.tempCtx = this.tempCanvas.getContext('2d', { alpha: false });
+    this.tempCtx.imageSmoothingEnabled = false;
+    
+    this.noiseCanvas = document.createElement('canvas');
+    this.noiseCtx = this.noiseCanvas.getContext('2d', { alpha: false });
+    this.noiseCtx.imageSmoothingEnabled = false;
+    this.motionMask = null;
+    this.outputImageData = null;
   }
 
   generateNoisePattern(width, height) {
-    const noiseCanvas = document.createElement('canvas');
-    noiseCanvas.width = width;
-    noiseCanvas.height = height;
-    const noiseCtx = noiseCanvas.getContext('2d');
-    const imageData = noiseCtx.createImageData(width, height);
+    const imageData = this.noiseCtx.createImageData(width, height);
+    const data = imageData.data;
+    const length = data.length;
     
-    for (let i = 0; i < imageData.data.length; i += 4) {
-      const value = Math.random() > 0.5 ? 255 : 0;
-      imageData.data[i] = value;     // R
-      imageData.data[i + 1] = value; // G
-      imageData.data[i + 2] = value; // B
-      imageData.data[i + 3] = 255;   // A
+    // Use Uint32Array for faster buffer manipulation
+    const buf = new Uint32Array(imageData.data.buffer);
+    
+    for (let i = 0; i < buf.length; i++) {
+      // Generate noise for 4 pixels at once
+      buf[i] = Math.random() > 0.5 ? 0xFFFFFFFF : 0xFF000000;
     }
     
-    noiseCtx.putImageData(imageData, 0, 0);
-    return noiseCanvas;
+    this.noiseCtx.putImageData(imageData, 0, 0);
+    return this.noiseCanvas;
   }
 
   detectMotion(currentFrame, previousFrame) {
-    const diffCanvas = document.createElement('canvas');
-    diffCanvas.width = currentFrame.width;
-    diffCanvas.height = currentFrame.height;
-    const diffCtx = diffCanvas.getContext('2d');
-    
-    diffCtx.globalCompositeOperation = 'difference';
-    diffCtx.drawImage(currentFrame, 0, 0);
-    diffCtx.drawImage(previousFrame, 0, 0);
-    
-    const diffData = diffCtx.getImageData(0, 0, diffCanvas.width, diffCanvas.height);
-    const motionMask = new Uint8ClampedArray(diffData.data.length / 4);
-    
-    for (let i = 0; i < diffData.data.length; i += 4) {
-      const diff = (diffData.data[i] + diffData.data[i + 1] + diffData.data[i + 2]) / 3;
-      motionMask[i / 4] = diff > 30 ? 1 : 0;
-    }
-    
-    return motionMask;
-  }
-
-  applyNoiseEffect(currentFrame, motionMask) {
     const width = currentFrame.width;
     const height = currentFrame.height;
+    const size = width * height;
     
-    const outputCanvas = document.createElement('canvas');
-    outputCanvas.width = width;
-    outputCanvas.height = height;
-    const outputCtx = outputCanvas.getContext('2d');
-    
-    // Draw static noise background first
-    if (!this.staticNoisePattern) {
-      this.staticNoisePattern = this.generateNoisePattern(width, height);
+    // Reuse existing arrays
+    if (!this.motionMask || this.motionMask.length !== size) {
+      this.motionMask = new Uint8ClampedArray(size);
     }
-    outputCtx.drawImage(this.staticNoisePattern, 0, 0);
     
-    // Only apply motion-based noise to moving regions
-    const frameData = outputCtx.getImageData(0, 0, width, height);
+    const currentData = this.tempCtx.getImageData(0, 0, width, height).data;
+    const prevData = this.previousCtx.getImageData(0, 0, width, height).data;
+    
+    // Optimize motion detection loop
+    for (let i = 0, j = 0; i < currentData.length; i += 16, j += 4) {
+      const diff = Math.abs(currentData[i] - prevData[i]) +
+                   Math.abs(currentData[i + 1] - prevData[i + 1]) +
+                   Math.abs(currentData[i + 2] - prevData[i + 2]);
+      
+      // Process 4 pixels at once
+      const motion = diff > 90 ? 1 : 0;
+      this.motionMask[j] = motion;
+      this.motionMask[j + 1] = motion;
+      this.motionMask[j + 2] = motion;
+      this.motionMask[j + 3] = motion;
+    }
+    
+    return this.motionMask;
+  }
+
+  applyNoiseEffect(width, height, motionMask) {
+    if (!this.outputImageData || this.outputImageData.width !== width) {
+      this.outputImageData = this.ctx.createImageData(width, height);
+    }
+    
+    const data = this.outputImageData.data;
     const newNoise = this.generateNoisePattern(width, height);
-    const newNoiseCtx = newNoise.getContext('2d');
-    const noiseData = newNoiseCtx.getImageData(0, 0, width, height);
+    const noiseData = this.noiseCtx.getImageData(0, 0, width, height).data;
     
-    // Get the current frame data for comparison
-    const currentData = outputCtx.getImageData(0, 0, width, height);
+    // Use TypedArray for faster array operations
+    const uint32Data = new Uint32Array(data.buffer);
+    const uint32Noise = new Uint32Array(noiseData.buffer);
     
-    for (let i = 0; i < frameData.data.length; i += 4) {
-      const pixelIndex = i / 4;
-      if (motionMask[pixelIndex]) {
-        // For moving regions, apply new random noise
-        const noiseValue = noiseData.data[i];
-        frameData.data[i] = noiseValue;     // R
-        frameData.data[i + 1] = noiseValue; // G
-        frameData.data[i + 2] = noiseValue; // B
-        frameData.data[i + 3] = 255;        // A
+    for (let i = 0; i < uint32Data.length; i++) {
+      if (motionMask[i]) {
+        uint32Data[i] = uint32Noise[i];
+      } else if (!this.staticNoisePattern) {
+        uint32Data[i] = uint32Noise[i];
       }
-      // Non-moving regions keep the static noise pattern
     }
     
-    outputCtx.putImageData(frameData, 0, 0);
-    return outputCanvas;
+    this.ctx.putImageData(this.outputImageData, 0, 0);
   }
 
   processFrame() {
@@ -101,22 +106,39 @@ export class NoiseEffect {
     const deltaTime = currentTime - this.lastProcessedTime;
     
     if (deltaTime >= this.processInterval) {
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = this.video.videoWidth;
-      tempCanvas.height = this.video.videoHeight;
-      const tempCtx = tempCanvas.getContext('2d');
-      tempCtx.drawImage(this.video, 0, 0);
+      const width = this.video.videoWidth;
+      const height = this.video.videoHeight;
       
-      if (this.previousFrame) {
-        const motionMask = this.detectMotion(tempCanvas, this.previousFrame);
-        const processedFrame = this.applyNoiseEffect(tempCanvas, motionMask);
-        this.ctx.drawImage(processedFrame, 0, 0, this.canvas.width, this.canvas.height);
-      } else {
-        this.staticNoisePattern = this.generateNoisePattern(this.video.videoWidth, this.video.videoHeight);
-        this.ctx.drawImage(this.staticNoisePattern, 0, 0, this.canvas.width, this.canvas.height);
+      // Setup canvases if needed
+      if (this.tempCanvas.width !== width) {
+        this.tempCanvas.width = width;
+        this.tempCanvas.height = height;
+        this.noiseCanvas.width = width;
+        this.noiseCanvas.height = height;
+        
+        if (!this.previousCtx) {
+          const prevCanvas = document.createElement('canvas');
+          prevCanvas.width = width;
+          prevCanvas.height = height;
+          this.previousCtx = prevCanvas.getContext('2d', { alpha: false });
+          this.previousCtx.imageSmoothingEnabled = false;
+        }
       }
       
-      this.previousFrame = tempCanvas;
+      // Draw current frame
+      this.tempCtx.drawImage(this.video, 0, 0);
+      
+      if (this.previousFrame) {
+        const motionMask = this.detectMotion(this.tempCanvas, this.previousFrame);
+        this.applyNoiseEffect(width, height, motionMask);
+      } else {
+        this.staticNoisePattern = this.generateNoisePattern(width, height);
+        this.ctx.drawImage(this.staticNoisePattern, 0, 0);
+      }
+      
+      // Store current frame
+      this.previousCtx.drawImage(this.tempCanvas, 0, 0);
+      this.previousFrame = this.tempCanvas;
       this.lastProcessedTime = currentTime;
     }
     
@@ -147,6 +169,7 @@ export class NoiseEffect {
     
     this.isCapturing = false;
     this.previousFrame = null;
+    this.previousCtx = null;
     this.staticNoisePattern = null;
     this.video.srcObject = null;
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
